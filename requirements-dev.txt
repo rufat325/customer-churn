@@ -1,0 +1,7 @@
+# Development and test dependencies.
+# Deliberately separate from requirements.txt so the runtime container does
+# not ship a test framework.
+-r requirements.txt
+
+pytest==9.1.1
+httpx2==2.10.0

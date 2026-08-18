@@ -1,34 +1,22 @@
+"""Command-line demo: score one example customer.
+
+Run from the project root:
+
+    python src/predict.py
+"""
+
+import sys
 from pathlib import Path
-
-import joblib
-import pandas as pd
-
-
-# ============================================================
-# Paths
-# ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-MODEL_PATH = (
-    PROJECT_ROOT
-    / "models"
-    / "churn_model.joblib"
-)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.scoring import ModelNotAvailable, load_model, score
 
 
-# ============================================================
-# Load trained model
-# ============================================================
-
-model = joblib.load(MODEL_PATH)
-
-
-# ============================================================
-# Example customer
-# ============================================================
-
-customer = pd.DataFrame([{
+EXAMPLE_CUSTOMER = {
     "age": 35,
     "country": "DE",
     "total_orders": 2,
@@ -42,37 +30,26 @@ customer = pd.DataFrame([{
     "product_view_count": 2,
     "tenure_days": 180,
     "events_last_30_days": 0,
-}])
+}
 
 
-# ============================================================
-# Prediction
-# ============================================================
+def main() -> int:
+    try:
+        model = load_model()
+    except ModelNotAvailable as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
 
-churn_probability = model.predict_proba(
-    customer
-)[0, 1]
+    result = score(model, EXAMPLE_CUSTOMER)
 
-prediction = int(
-    churn_probability >= 0.5
-)
+    print("CUSTOMER CHURN PREDICTION")
+    print("--------------------------")
+    print(f"Churn probability: {result['churn_probability']:.2%}")
+    print(f"Predicted churn:   {result['predicted_churn']}")
+    print(f"Risk level:        {result['risk_level']}")
+
+    return 0
 
 
-# ============================================================
-# Output
-# ============================================================
-
-print("CUSTOMER CHURN PREDICTION")
-print("--------------------------")
-print(
-    f"Churn probability: {churn_probability:.2%}"
-)
-
-print(
-    f"Predicted churn: {prediction}"
-)
-
-if prediction == 1:
-    print("Risk level: HIGH")
-else:
-    print("Risk level: LOW")
+if __name__ == "__main__":
+    raise SystemExit(main())
