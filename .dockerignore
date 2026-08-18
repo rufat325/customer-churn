@@ -8,4 +8,7 @@ data/
 notebooks/
 tests/
 .pytest_cache/
+pytest.ini
+requirements-dev.txt
 .env
+*.pem
