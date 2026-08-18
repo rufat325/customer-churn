@@ -1,8 +1,40 @@
+"""Customer-level churn feature engineering.
+
+The observation period and the target period are defined as two adjacent,
+non-overlapping windows around ``PREDICTION_DATE``:
+
+    history:  order_date <= PREDICTION_DATE
+    target:   PREDICTION_DATE < order_date <= PREDICTION_DATE + TARGET_WINDOW_DAYS
+
+Together they partition the timeline with no gap and no overlap, so no
+transaction is either counted twice or silently dropped. Features are built
+only from the history window; the target window is used only to build the
+label and must never reach the model.
+"""
+
 import pandas as pd
 
 
+# The last day of observed history, inclusive. Everything on or before this
+# date is knowable at prediction time; everything after it is the target.
 PREDICTION_DATE = pd.Timestamp("2025-11-30")
-HISTORY_CUTOFF = PREDICTION_DATE - pd.Timedelta(days=30)
+
+# Length of the target window, in days.
+TARGET_WINDOW_DAYS = 30
+
+# A customer must have signed up at least this long before the prediction
+# date to have enough history to score.
+MIN_TENURE_DAYS = 30
+
+# Length of the "recent activity" lookback, in days.
+RECENT_ACTIVITY_DAYS = 30
+
+EVENT_COUNT_COLUMNS = [
+    "login_count",
+    "product_view_count",
+    "add_to_cart_count",
+    "checkout_count",
+]
 
 
 def build_features(
@@ -10,13 +42,15 @@ def build_features(
     orders: pd.DataFrame,
     website_events: pd.DataFrame,
     prediction_date: pd.Timestamp = PREDICTION_DATE,
+    target_window_days: int = TARGET_WINDOW_DAYS,
 ) -> pd.DataFrame:
     """
     Build customer-level churn features and target.
 
-    Historical information is restricted to data available before
-    the prediction date. The churn target is based on orders during
-    the 30-day period following the prediction date.
+    Returns one row per eligible customer, with the model features, the
+    ``future_orders`` count used to derive the label, and the ``churn``
+    label itself. Callers must drop ``future_orders`` (and the identifier
+    and date columns) before training.
     """
 
     customers = customers.copy()
@@ -46,29 +80,43 @@ def build_features(
     orders = orders.drop_duplicates()
 
     # ---------------------------------------------------------
-    # 3. Customer eligibility
+    # 3. Window boundaries
     # ---------------------------------------------------------
-    # Customers must have been signed up for at least 30 days
-    # before the prediction date.
+    # History is inclusive of the prediction date; the target window opens
+    # the following day. Deriving both from the same anchor is what keeps
+    # them adjacent. An earlier version of this module derived them
+    # independently and shifted the target by one day (see README section
+    # 10), which mislabelled 61 customers.
 
-    eligibility_date = prediction_date - pd.Timedelta(days=30)
+    target_start = prediction_date + pd.Timedelta(days=1)
+    target_end = prediction_date + pd.Timedelta(days=target_window_days)
+
+    recent_activity_start = prediction_date - pd.Timedelta(
+        days=RECENT_ACTIVITY_DAYS - 1
+    )
+
+    # ---------------------------------------------------------
+    # 4. Customer eligibility
+    # ---------------------------------------------------------
+
+    eligibility_date = prediction_date - pd.Timedelta(days=MIN_TENURE_DAYS)
 
     eligible_customers = customers[
         customers["signup_date"] <= eligibility_date
     ].copy()
 
+    eligible_ids = eligible_customers["customer_id"]
+
     # ---------------------------------------------------------
-    # 4. Historical orders
+    # 5. Historical orders
     # ---------------------------------------------------------
 
     historical_orders = orders[
-        orders["order_date"] < prediction_date
+        orders["order_date"] <= prediction_date
     ].copy()
 
     historical_orders = historical_orders[
-        historical_orders["customer_id"].isin(
-            eligible_customers["customer_id"]
-        )
+        historical_orders["customer_id"].isin(eligible_ids)
     ]
 
     order_features = (
@@ -83,7 +131,7 @@ def build_features(
     )
 
     # ---------------------------------------------------------
-    # 5. Days since last order
+    # 6. Days since last order
     # ---------------------------------------------------------
 
     order_features["days_since_last_order"] = (
@@ -93,17 +141,15 @@ def build_features(
     order_features["has_previous_order"] = 1
 
     # ---------------------------------------------------------
-    # 6. Historical website events
+    # 7. Historical website events
     # ---------------------------------------------------------
 
     historical_events = website_events[
-        website_events["event_date"] < prediction_date
+        website_events["event_date"] <= prediction_date
     ].copy()
 
     historical_events = historical_events[
-        historical_events["customer_id"].isin(
-            eligible_customers["customer_id"]
-        )
+        historical_events["customer_id"].isin(eligible_ids)
     ]
 
     # Total events
@@ -136,25 +182,20 @@ def build_features(
         }
     )
 
-    # Make sure all expected event columns exist
-    expected_event_columns = [
-        "login_count",
-        "product_view_count",
-        "add_to_cart_count",
-        "checkout_count",
-    ]
-
-    for column in expected_event_columns:
+    # Make sure all expected event columns exist, and drop any event type
+    # the pivot produced that the model does not know about.
+    for column in EVENT_COUNT_COLUMNS:
         if column not in event_counts.columns:
             event_counts[column] = 0
 
+    event_counts = event_counts[["customer_id"] + EVENT_COUNT_COLUMNS]
+
     # ---------------------------------------------------------
-    # 7. Recent website activity
+    # 8. Recent website activity
     # ---------------------------------------------------------
 
     recent_events = historical_events[
-        historical_events["event_date"]
-        >= prediction_date - pd.Timedelta(days=30)
+        historical_events["event_date"] >= recent_activity_start
     ]
 
     recent_event_counts = (
@@ -165,83 +206,67 @@ def build_features(
     )
 
     # ---------------------------------------------------------
-    # 8. Combine customer features
+    # 9. Combine customer features
     # ---------------------------------------------------------
 
     features = eligible_customers.copy()
 
-    features = features.merge(
+    for frame in (
         order_features,
-        on="customer_id",
-        how="left",
-    )
-
-    features = features.merge(
         total_events,
-        on="customer_id",
-        how="left",
-    )
-
-    features = features.merge(
         event_counts,
-        on="customer_id",
-        how="left",
-    )
-
-    features = features.merge(
         recent_event_counts,
-        on="customer_id",
-        how="left",
-    )
-
-    # ---------------------------------------------------------
-    # 9. Fill appropriate missing values
-    # ---------------------------------------------------------
-
-    features["total_orders"] = (
-        features["total_orders"].fillna(0)
-    )
-
-    features["total_spent"] = (
-        features["total_spent"].fillna(0)
-    )
-
-    features["total_events"] = (
-        features["total_events"].fillna(0)
-    )
-
-    features["events_last_30_days"] = (
-        features["events_last_30_days"].fillna(0)
-    )
-
-    features["has_previous_order"] = (
-        features["has_previous_order"].fillna(0)
-    )
-
-    for column in expected_event_columns:
-        features[column] = (
-            features[column].fillna(0)
+    ):
+        features = features.merge(
+            frame,
+            on="customer_id",
+            how="left",
         )
 
     # ---------------------------------------------------------
     # 10. Customer tenure
     # ---------------------------------------------------------
+    # Computed before the recency fill below, which depends on it.
 
     features["tenure_days"] = (
         prediction_date - features["signup_date"]
     ).dt.days
 
     # ---------------------------------------------------------
-    # 11. Future orders
+    # 11. Fill missing values
     # ---------------------------------------------------------
-    # This is used ONLY to construct the target.
-    # It must never be used as a model feature.
+    # A missing count means the customer had no such activity, so zero is
+    # the right fill. Recency is different: a customer who has never
+    # ordered has no "days since last order" at all. Filling it with the
+    # column median (the previous behaviour) made the highest-risk segment
+    # look like an average recent buyer, so it is filled with tenure_days
+    # instead: it has been their entire lifetime since they last ordered,
+    # which is both true and monotonic with risk.
 
-    future_end = prediction_date + pd.Timedelta(days=30)
+    zero_filled = [
+        "total_orders",
+        "total_spent",
+        "total_events",
+        "events_last_30_days",
+        "has_previous_order",
+        *EVENT_COUNT_COLUMNS,
+    ]
+
+    for column in zero_filled:
+        features[column] = features[column].fillna(0)
+
+    features["days_since_last_order"] = (
+        features["days_since_last_order"].fillna(features["tenure_days"])
+    )
+
+    # ---------------------------------------------------------
+    # 12. Target window
+    # ---------------------------------------------------------
+    # Used ONLY to construct the label. Never a model feature.
 
     future_orders = orders[
-        (orders["order_date"] >= prediction_date)
-        & (orders["order_date"] < future_end)
+        (orders["order_date"] >= target_start)
+        & (orders["order_date"] <= target_end)
     ]
 
     future_order_counts = (
@@ -262,7 +287,7 @@ def build_features(
     )
 
     # ---------------------------------------------------------
-    # 12. Create churn target
+    # 13. Create churn target
     # ---------------------------------------------------------
 
     features["churn"] = (
