@@ -1,8 +1,17 @@
-data/
+# Generated data and trained artifacts are reproducible from source, so they
+# are not tracked. The keepfiles preserve the directories themselves.
+data/*
+!data/.gitkeep
+
+models/*
+!models/.gitkeep
+
 .venv/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+.pytest_cache/
 .env
-models/
+
+# Private keys must never be committed.
 *.pem
