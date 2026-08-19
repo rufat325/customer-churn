@@ -1,20 +1,21 @@
 # Customer Churn Prediction API
 
 An end-to-end machine learning project that predicts customer churn from
-demographics, order history and website activity, and serves the model behind a
-containerized REST API.
+demographics, order history and website activity, serves it behind a
+containerized REST API — and then asks the harder questions: how good could
+this model possibly be, does it survive contact with time, and is predicting
+churn even the right problem?
 
-The project covers the full lifecycle: data generation, profiling, feature
-engineering, target construction, model selection and tuning, probability
-calibration, cost-based threshold selection, evaluation against a baseline *and
-against a measured theoretical ceiling*, automated tests, CI, a FastAPI service,
-Docker packaging and AWS EC2 deployment.
+**Headline result:** test ROC-AUC **0.669 [0.626, 0.711]** against a 64.6%
+base rate and a measured ceiling of **0.727**.
 
-**Headline result:** test ROC-AUC **0.7231** against a 68.1% majority-class base
-rate, with a measured ceiling of **0.7575**. The model captures roughly 87% of
-the signal that is theoretically extractable from this data — see
-[section 10](#10-how-good-can-this-model-possibly-get), which is the most
-distinctive part of the project.
+Three findings matter more than that number:
+
+| Finding | Where |
+| --- | --- |
+| Reframing the target from a 30-day to a 90-day window raises the achievable ceiling by **+0.10 AUC** — six times the best feature-engineering gain | [§10](#10-the-ceiling-and-how-to-raise-it) |
+| A regime change in the data leaves ROC-AUC almost untouched while calibration error hits **11 points** — monitoring discrimination alone would miss it entirely | [§11](#11-walk-forward-validation) |
+| Targeting a retention campaign by churn probability performs **no better than random**; an uplift model captures 87% of the achievable gain | [§12](#12-uplift-who-should-we-actually-contact) |
 
 ---
 
@@ -31,13 +32,12 @@ python -m venv .venv
 pip install -r requirements-dev.txt
 ```
 
-Neither the generated data nor the trained model is tracked in git, so build
-them before anything else:
+Data and model artifacts are not tracked in git, so build them first:
 
 ```bash
 python src/generate_data.py     # writes data/*.csv
 python src/train.py             # writes models/churn_model.joblib + model_card.json
-python -m pytest                # 48 passed
+python -m pytest                # 73 passed
 ```
 
 Then score a customer, or start the API:
@@ -52,625 +52,483 @@ failing if you have not run `train.py` yet.
 
 ---
 
-## 2. Project Objective
+## 2. What "churn" means here
 
-Predict whether an eligible customer will churn, using only information
-available on or before a fixed prediction date. Future behaviour must never
-leak into the model's inputs.
+Churn is **placing no order in the 30 days following the prediction date**.
 
-The service returns a calibrated churn probability, a binary prediction at a
-cost-optimal threshold, and a risk band.
+This is a purchase-frequency definition, not a subscription cancellation, which
+is why the base rate is 64.6% — most customers simply do not buy in a given
+month. Read every metric with that in mind.
 
-### What "churn" means here
-
-Churn is defined as **placing no order in the 30 days following the prediction
-date**. This is a purchase-frequency definition rather than a
-subscription-cancellation definition, and it is why the base rate is so high
-(68.1%): most customers simply do not buy something in any given month.
-
-That is a legitimate target, but read every metric with it in mind. It is also
-the single biggest lever on model quality — see
-[section 10](#10-how-good-can-this-model-possibly-get).
+It is also, as [§10](#10-the-ceiling-and-how-to-raise-it) shows with numbers,
+the single largest constraint on how good this model can be.
 
 ---
 
-## 3. Project Architecture
+## 3. Data
 
-```text
-generate_data.py
-      |
-      v
-Feature Engineering  (features.py)
-      |
-      v
-Train / Validation / Test Split
-      |
-      v
-Gradient Boosting + Grid Search
-      |
-      v
-Probability Calibration (isotonic)
-      |
-      v
-Cost-Based Threshold Selection
-      |
-      +---------------------------+
-      |                           |
-      v                           v
-churn_model.joblib         model_card.json
-      |                           |
-      +------------+--------------+
-                   |
-      +------------+------------+
-      |                         |
-      v                         v
-  predict.py                FastAPI
-                                |
-                                v
-                             Docker
-                                |
-                                v
-                             AWS EC2
-```
+`src/generate_data.py` produces four datasets spanning **2024-01-01 to
+2026-03-31**: 5,000 customers, ~34,900 orders, ~89,900 website events, and a
+randomized retention campaign.
 
----
+| File | Contents |
+| --- | --- |
+| `customers.csv` | customer_id, age, country, signup_date |
+| `orders.csv` | order_id, customer_id, order_date, amount |
+| `website_events.csv` | event_id, customer_id, event_type, event_date |
+| `campaign.csv` | customer_id, treated, ordered_in_campaign |
 
-## 4. Data
+### Hidden traits
 
-Three synthetic datasets, produced by `src/generate_data.py`: 5,000 customers,
-20,298 orders (18,040 history + 2,208 target + 50 deliberate duplicates) and
-50,018 website events.
+Every customer carries three traits that are dropped before the CSVs are
+written, so a model must infer them from behaviour:
 
-### Customers
+- **`activity_level`** — how often they order
+- **`drift`** — how that propensity changes over time
+- **`browse_bias`** — how much they browse relative to how much they buy
 
-| Column      | Description                |
-| ----------- | -------------------------- |
-| customer_id | Unique customer identifier |
-| age         | Customer age               |
-| country     | Customer country           |
-| signup_date | Customer registration date |
-
-### Orders
-
-| Column      | Description             |
-| ----------- | ----------------------- |
-| order_id    | Unique order identifier |
-| customer_id | Customer identifier     |
-| order_date  | Order date              |
-| amount      | Order amount            |
-
-### Website Events
-
-| Column      | Description           |
-| ----------- | --------------------- |
-| event_id    | Event identifier      |
-| customer_id | Customer identifier   |
-| event_type  | Type of website event |
-| event_date  | Event date            |
-
-### Learnable without being leaky
-
-Each customer is assigned a hidden `activity_level` drawn from a Beta
-distribution. It drives their order rate and their browsing rate, and is
-**dropped before the CSVs are written**. So there is genuine signal connecting
-past behaviour to future behaviour, but a model has to infer it from observed
-history rather than reading it off a column.
-
-The generator also injects realistic defects on purpose: 100 missing ages and
-50 duplicate order rows.
+Keeping them out of the data is what makes the problem honest; being able to
+recover them from the seeded generator is what makes the ceiling measurable.
 
 ### Behaviour is a rate process
 
-For each customer, the expected number of orders in a window is
+Orders and events are an inhomogeneous Poisson process. For each customer, each
+day of their lifetime:
 
 ```text
-rate(activity_level) x exposure_days
+intensity = base_rate(activity_level) * exp(drift * years_since_signup)
 ```
 
-where exposure is the overlap between the window and that customer's lifetime.
-The realised count is Poisson, and dates are drawn uniformly inside the
-customer's own eligible range.
+Counts are Poisson, dates fall only inside a customer's own lifetime, and
+exposure drives volume.
 
-**This is a correction.** An earlier version drew a fixed global number of
-orders, picked *who* placed them from the activity weights, then assigned each
-one a date drawn uniformly across the whole calendar year — independently of
-signup. The consequences were severe:
+### Two corrections worth recording
+
+**Dates used to precede signup.** An earlier generator drew a fixed global
+number of orders, chose *who* placed them from the activity weights, then
+assigned each a date drawn uniformly across the calendar — independently of
+signup:
 
 ```text
-orders placed before their customer signed up: 9,744 / 20,200  (48.2%)
+orders placed before their customer signed up: 9,744 / 20,200 (48.2%)
 events logged before their customer signed up: 24,842 / 50,000 (49.7%)
 correlation(tenure_days, total_orders):        0.006
 ```
 
-One customer signed up on 2025-12-31 and had an order dated 2025-01-03. Under
-the current generator no event can precede its customer's signup, and that
-correlation is **0.498**, as it should be. `src/generate_data.py` asserts both
-properties at build time, and `tests/test_generate_data.py` pins them.
+One customer signed up on 2025-12-31 with an order dated 2025-01-03. That
+correlation is now **0.498**. The fix reversed a modelling conclusion: on the
+incoherent data, exposure-normalised rate features made the model *worse*,
+which looked like a fact about rate features and was actually a symptom of the
+bug.
 
-This was not a cosmetic fix. It reversed a modelling conclusion — see
-[section 6](#6-feature-engineering).
+**History and the future used to obey different laws.** History was generated
+with `activity ** 2` and the target window with `activity ** 3` — a regime
+change at the prediction date. It made walk-forward validation meaningless,
+since each prediction date would be predicting a different process. One
+stationary process per customer, modulated by personal drift, replaces it.
+
+Both properties are asserted at generation time and pinned by tests.
 
 ---
 
-## 5. Prediction Methodology
+## 4. Prediction methodology
 
-The prediction date is `2025-11-30`, the **last day of observed history,
-inclusive**. The timeline is partitioned into two adjacent windows:
+The prediction date is `2025-12-31`, the last day of observed history,
+inclusive. The timeline partitions into two adjacent windows:
 
 ```text
         history window                    target window
   <------------------------->   <--------------------------->
-  2025-01-01 ... 2025-11-30     2025-12-01 ... 2025-12-30
+  2024-01-01 ... 2025-12-31     2026-01-01 ... 2026-01-30
        (features)                       (label only)
                             ^
                      prediction date
 ```
 
-- **History:** `order_date <= 2025-11-30`. All features are built from this.
-- **Target:** `2025-11-30 < order_date <= 2025-12-30`. Label only, never a
-  feature.
+Both boundaries derive from the same anchor, so no order can fall in both
+(leaking the target) or in neither (silently discarding data). A test sweeps
+every offset from −2 to +32 days to enforce it.
 
-Both boundaries are derived from the same anchor in `src/features.py`, so they
-are adjacent by construction: no order can fall in both (which would leak the
-target) and none can fall in neither (which would silently discard data). A test
-sweeps every offset from −2 to +32 days to enforce it.
-
-Customers must have signed up at least 30 days before the prediction date to be
-eligible: **4,156** of 5,000 customers, with a churn rate of **0.6809**.
+Customers must have signed up at least 30 days before the prediction date:
+**4,418** of 5,000 eligible, churn rate **0.6464**.
 
 ---
 
-## 6. Feature Engineering
+## 5. Feature engineering
 
-### Supplied by the caller (13 columns)
+**Supplied by the caller (13):** `age`, `country`, `tenure_days`,
+`total_orders`, `total_spent`, `days_since_last_order`, `has_previous_order`,
+`total_events`, `add_to_cart_count`, `checkout_count`, `login_count`,
+`product_view_count`, `events_last_30_days`.
 
-| Group | Features |
-| --- | --- |
-| Customer | `age`, `country`, `tenure_days` |
-| Orders | `total_orders`, `total_spent`, `days_since_last_order`, `has_previous_order` |
-| Website | `total_events`, `add_to_cart_count`, `checkout_count`, `login_count`, `product_view_count`, `events_last_30_days` |
+**Derived inside the pipeline (6):** `orders_per_day`, `events_per_day`,
+`spend_per_order`, `checkout_rate`, `cart_rate`, `recency_ratio`.
 
-### Derived inside the pipeline (6 more)
-
-`orders_per_day`, `events_per_day`, `spend_per_order`, `checkout_rate`,
-`cart_rate`, `recency_ratio`.
-
-These are computed by a `FunctionTransformer` as the first pipeline step, **not
-requested from the caller**. They are deterministic functions of the columns
-above, so asking a client to supply them would only create an opportunity to
-disagree with training. The API contract stays at 13 fields, and train/serve
+Derived features are computed by a `FunctionTransformer` as the first pipeline
+step, not requested from the caller. They are deterministic functions of the
+raw columns, so asking a client to supply them would only create an opportunity
+to disagree with training. The API contract stays at 13 fields and train/serve
 skew is structurally impossible.
 
-### Why rates matter — and a reversed conclusion
+Raw counts conflate propensity with exposure; dividing by tenure separates
+them. `tenure_days` predicts almost nothing on its own — signup dates are
+independent of activity — but it is the denominator that makes the rates work,
+which is why it ranks second in permutation importance.
 
-The hidden driver is a *rate*. A raw count is that rate multiplied by exposure,
-so `total_orders` conflates "how keen is this customer" with "how long have they
-had the chance". Dividing by tenure separates the two:
-
-| Feature | Spearman vs. hidden driver |
-| --- | ---: |
-| `total_orders` | 0.622 |
-| **`orders_per_day`** | **0.729** |
-| `total_events` | 0.609 |
-| **`events_per_day`** | **0.806** |
-| `tenure_days` | −0.009 |
-
-Worth recording honestly: on the *old, temporally incoherent* data these rate
-features made the model slightly worse, and `orders_per_day` was a weaker signal
-than `total_orders` (0.633 vs 0.757). That was not a fact about rate features —
-it was a symptom of the data bug. With signup dates unrelated to order dates,
-dividing by tenure only added noise. Fixing the generator reversed the result.
-
-`tenure_days` sitting near zero on its own is expected and correct: signup dates
-are drawn independently of activity, so tenure predicts nothing by itself. It
-matters as a *denominator*.
-
-### Missing values
-
-Count features are filled with `0`: no matching rows genuinely means no
-activity.
-
-`days_since_last_order` is different. Customers who have never ordered have an
-undefined value, not a missing-at-random one. Filling it with the column median
-told the model that a customer who has never bought anything last bought at a
-typical time. It is now filled with `tenure_days` — it has been their entire
-lifetime since they last ordered, which is true and monotonic with risk.
-
-`age` retains genuine missing values and is median-imputed inside the pipeline,
-which is appropriate — those are missing at random by construction.
+**Missing values.** Counts fill with `0`. `days_since_last_order` is undefined
+rather than missing-at-random for customers who never ordered, so it fills with
+`tenure_days`: it has been their entire lifetime since they last ordered.
 
 ---
 
-## 7. Train / Validation / Test
+## 6. Model
+
+Gradient Boosting, selected over Logistic Regression and Random Forest in
+`notebooks/01_data_profiling.ipynb`.
 
 ```text
-Training:   70%   (2,909)
-Validation: 15%   (623)
-Test:       15%   (624)
+learning_rate = 0.05    max_depth = 2
+n_estimators  = 100     min_samples_leaf = 10
 ```
 
-Stratified on churn. Hyperparameters are selected by 5-fold cross-validation on
-the training split only. Calibration is fitted with its own internal CV on the
-training split, which leaves validation clean for threshold selection. The test
-split is touched once, at the end.
-
----
-
-## 8. Model
-
-Model families investigated in `notebooks/01_data_profiling.ipynb`: Logistic
-Regression, Random Forest, Gradient Boosting. Gradient Boosting won.
-
-```text
-learning_rate    = 0.03
-max_depth        = 2
-min_samples_leaf = 10
-n_estimators     = 100
-```
-
-5-fold CV ROC-AUC on the training split: **0.7378**
+5-fold CV ROC-AUC on the training split: **0.6923**
 
 ### Calibration
 
-Gradient boosting optimises a ranking-friendly loss, so its raw scores are not
-probabilities. Both isotonic and sigmoid calibration are fitted and the better
-is selected on validation Brier score:
+Gradient boosting optimises a ranking loss, so raw scores are not
+probabilities. Isotonic and sigmoid are both fitted with internal CV on the
+training split — leaving validation clean for threshold selection — and the
+better is chosen on validation Brier score. Isotonic wins.
 
-| | Validation Brier |
-| --- | ---: |
-| uncalibrated | 0.1850 |
-| sigmoid | 0.1847 |
-| **isotonic (selected)** | **0.1834** |
-
-Reliability on validation after calibration:
-
-| Bin | n | Mean predicted | Observed |
+| Bin | n | Predicted | Observed |
 | --- | ---: | ---: | ---: |
-| 0.2–0.4 | 78 | 0.342 | 0.385 |
-| 0.4–0.6 | 127 | 0.519 | 0.551 |
-| 0.6–0.8 | 170 | 0.706 | 0.641 |
-| 0.8–1.0 | 246 | 0.874 | 0.874 |
-
-Close to the diagonal, so the probabilities can be read as probabilities. The
-improvement over uncalibrated is small — gradient boosting on this data was
-already reasonably calibrated — but the check is what makes that claim, rather
-than an assumption.
-
-The whole thing (rate derivation, preprocessing, estimator, calibration) is one
-serialized object, so the exact transformations used at training time are
-applied at inference time. Feature lists live in `src/scoring.py` and are
-imported by both the training script and the API.
+| 0.2–0.4 | 66 | 0.332 | 0.348 |
+| 0.4–0.6 | 155 | 0.494 | 0.516 |
+| 0.6–0.8 | 288 | 0.702 | 0.674 |
+| 0.8–1.0 | 150 | 0.859 | 0.867 |
 
 ---
 
-## 9. Model Performance
+## 7. Results, with error bars
 
 | | Accuracy | Precision | Recall | F1 | ROC-AUC | Brier |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Baseline / test | 0.6811 | 0.6811 | 1.0000 | 0.8103 | n/a | n/a |
-| **Model / test** @ 0.83 | 0.5545 | 0.8731 | 0.4047 | 0.5531 | **0.7231** | 0.1900 |
+| Baseline (predict churn for all) | 0.6456 | 0.6456 | 1.0000 | 0.7846 | n/a | n/a |
+| **Model** @ threshold 0.80 | 0.4992 | 0.8333 | 0.2804 | 0.4196 | **0.6689** | 0.2116 |
 
-"Baseline" is the majority-class classifier: predict churn for everyone.
+A point estimate from 663 test rows is not a four-significant-figure number:
 
-### Reading these numbers honestly
+| Score | ROC-AUC | 95% CI |
+| --- | ---: | --- |
+| Model | 0.6689 | [0.6255, 0.7109] |
+| Recency heuristic (`days_since_last_order`) | 0.5939 | [0.5494, 0.6375] |
+| **Difference (paired)** | **+0.0750** | **[0.0366, 0.1146]** |
 
-At the operating threshold the model has **lower accuracy and lower F1 than
-predicting churn for everyone**. That is not a failure, and it is not hidden
-here — it is the expected consequence of two things:
+The model beats the obvious business rule in **100% of bootstrap resamples**.
+That comparison is paired — both scores are computed on identical rows — which
+matters, because checking whether two independent intervals overlap is a
+different and much weaker question. Two models can have heavily overlapping
+intervals while one wins essentially always, since their errors are correlated.
+Overlap is not a significance test. `src/evaluation.py` implements both, and
+`tests/test_evaluation.py` includes a case where the naive comparison fails and
+the paired test resolves it.
 
-1. **Accuracy is the wrong metric at a 68% base rate.** A constant classifier
-   scores 0.681 while being useless.
-2. **The threshold is not tuned for accuracy.** It is tuned for expected value
-   under a cost model, which deliberately trades recall for precision.
+### Reading the thresholded numbers
 
-The two numbers that matter are **ROC-AUC 0.7231** (the model ranks a random
-churner above a random non-churner 72% of the time — something the baseline
-cannot do at all) and **precision 0.8731** at the operating point (of the
-customers it flags, 87% really do churn, versus 68% for blanket contact).
+At the operating threshold the model has **lower accuracy and F1 than the
+majority-class baseline**. That is expected, not hidden: accuracy is a poor
+metric at a 65% base rate, and the threshold is tuned for expected value, not
+accuracy. What it buys is precision — **0.833 against 0.646** — and the ranking
+underneath.
 
 ### Permutation importance (validation, drop in ROC-AUC)
 
 | Feature | Δ ROC-AUC |
 | --- | ---: |
-| `total_events` | 0.1264 ± 0.0170 |
-| `tenure_days` | 0.0906 ± 0.0125 |
-| `total_orders` | 0.0575 ± 0.0160 |
-| `total_spent` | 0.0039 ± 0.0015 |
-| `days_since_last_order` | 0.0017 ± 0.0018 |
-
-Browsing volume dominates, which makes sense: with 50,018 events against 18,040
-orders, events are simply a larger sample from which to estimate the same
-underlying rate. `tenure_days` ranks second precisely because of its role as a
-denominator — permuting it corrupts every derived rate at once.
-
-### Choosing the threshold from costs, not convention
-
-An operating threshold should come from what a decision is worth. The cost model
-is: contacting a customer costs `offer_cost`; if they were going to churn and
-they accept, it earns `margin` with probability `accept_rate`.
-
-The optimal threshold depends entirely on those numbers, so the project sweeps
-them rather than quoting one figure. Threshold chosen on validation, valued on
-the 624-customer test split:
-
-| Scenario | TP value | FP value | Threshold | Contact all | Targeted | Uplift |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| cheap offer | +10 | −5 | 0.26 | 3,255 | 3,275 | +20 |
-| **standard offer** (shipped) | +3 | −12 | **0.83** | −1,113 | **216** | **+1,329** |
-| premium offer | −5 | −20 | 0.98 | −6,105 | 0 | +6,105 |
-
-Three genuinely different regimes:
-
-- **Cheap offer:** contacting the entire base is already profitable at a 68%
-  churn rate, and the model adds almost nothing (+20, or 0.6%). Worth stating
-  plainly — a model is not always the answer.
-- **Standard offer:** blanket contact loses 1,113; targeting turns it into +216.
-  The model converts a loss-making campaign into a profitable one.
-- **Premium offer:** a true positive is worth −5, so no contact is ever
-  worthwhile. The optimiser correctly selects a threshold that contacts nobody.
-  The right answer is "do not run this campaign".
-
-The shipped threshold of **0.83** comes from the standard scenario and is
-persisted in `models/model_card.json`, which the API reads at startup and serves
-at `GET /model`. Changing the economics changes the threshold without touching
-the model.
-
-Risk bands are anchored to that threshold rather than to fixed cut points:
-`LOW` below it, and the region above it split into `MEDIUM` and `HIGH`. Fixed
-bands at 0.50/0.75 left `MEDIUM` unreachable once the tuned threshold rose above
-0.75; a test now asserts all three bands are reachable at any threshold.
+| `total_orders` | 0.1193 ± 0.0137 |
+| `tenure_days` | 0.0564 ± 0.0071 |
+| `total_events` | 0.0237 ± 0.0073 |
+| `days_since_last_order` | 0.0038 ± 0.0051 |
 
 ---
 
-## 10. How Good Can This Model Possibly Get?
+## 8. Choosing the threshold from costs
 
-Full analysis: [`notebooks/02_headroom_analysis.ipynb`](notebooks/02_headroom_analysis.ipynb)
+Contacting a customer costs `offer_cost`; if they were churning and accept, it
+earns `margin` with probability `accept_rate`. The optimal threshold depends
+entirely on those numbers, so the project sweeps them rather than quoting one.
+Chosen on validation, valued on the 663-customer test split:
 
-A test ROC-AUC of 0.72 invites an obvious question — is that good, or is there
-another 0.15 on the table? Normally you cannot answer it. Here you can, because
-the generating process is known.
+| Scenario | TP | FP | Threshold | Contact all | Targeted | Uplift |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| cheap offer | +10 | −5 | 0.25 | 3,105 | 3,120 | +15 |
+| **standard offer** (shipped) | +3 | −12 | **0.80** | −1,536 | **72** | **+1,608** |
+| premium offer | −5 | −20 | 0.96 | −6,840 | 0 | +6,840 |
 
-Since every customer's hidden `activity_level` is recoverable from the seeded
-generator, we can build an **oracle** that sees the driver directly. Nothing
-built from observed behaviour can beat a model that already knows the quantity
-that behaviour is a noisy measurement of. Its score is the ceiling.
+Three regimes. With a cheap offer, blanket contact is already profitable and
+the model adds almost nothing — **a model is not always the answer**. With a
+standard offer it turns a loss-making campaign profitable. With a premium offer
+no contact is ever worthwhile and the optimiser correctly selects nobody.
+
+The shipped threshold is persisted in `models/model_card.json`, which the API
+reads at startup and serves at `GET /model`. Changing the economics changes the
+threshold without retraining.
+
+Risk bands anchor to that threshold rather than fixed cut points: `LOW` below
+it, the region above split into `MEDIUM` and `HIGH`. Fixed bands at 0.50/0.75
+left `MEDIUM` unreachable once the tuned threshold rose above 0.75.
+
+---
+
+## 9. Notebooks
+
+| Notebook | Question |
+| --- | --- |
+| [`01_data_profiling`](notebooks/01_data_profiling.ipynb) | Original exploration and model selection *(predates the generator rebuild; kept as the record)* |
+| [`02_headroom_and_target`](notebooks/02_headroom_and_target.ipynb) | How good can this get, and what raises the ceiling? |
+| [`03_temporal_validation`](notebooks/03_temporal_validation.ipynb) | Does it survive contact with time? |
+| [`04_uplift_modelling`](notebooks/04_uplift_modelling.ipynb) | Is predicting churn even the right problem? |
+
+---
+
+## 10. The ceiling, and how to raise it
+
+Full analysis: [`notebooks/02_headroom_and_target.ipynb`](notebooks/02_headroom_and_target.ipynb)
+
+Churn is "no order in the window", so if the true expected order count is `L`,
+the true churn probability is `exp(-L)`. That is monotone in `L`, so ranking by
+`-L` is Bayes-optimal and its ROC-AUC is the **ceiling** for any model of this
+target. `expected_orders()` computes `L` exactly from the hidden traits.
+
+At the shipped 30-day window:
 
 | Feature set | Test ROC-AUC |
 | --- | ---: |
-| Raw counts only | 0.7139 |
-| Shipped (raw + derived rates) | 0.7195 |
-| **ORACLE: hidden `activity_level` alone** | **0.7575** |
-| Oracle + observed features | 0.7611 |
+| Raw counts only | 0.6556 [0.6132, 0.6992] |
+| Shipped (raw + derived rates) | 0.6725 [0.6290, 0.7146] |
+| **ORACLE (true expected orders)** | **0.7274 [0.6869, 0.7669]** |
 
-*(Fixed hyperparameters across all four, so the only thing varying is the
-feature set. The shipped model's tuned and calibrated score of 0.7231 is
-slightly higher than the 0.7195 shown here.)*
+Those intervals overlap heavily, yet the paired comparison is unambiguous: the
+oracle beats the shipped model by +0.0550 [0.0254, 0.0850], winning **100% of
+resamples**. Overlap is not a significance test.
 
-**The ceiling is 0.7575, not 1.0 and not 0.85.** Knowing every customer's true
-propensity *perfectly* still only scores about 0.76, because the target asks
-something inherently noisy: not "is this customer disengaging" but "will this
-specific customer happen to order in these specific 30 days".
+### The target is the constraint
 
-Two consequences:
+Mean expected orders per customer in a 30-day window is well under one. The
+label is mostly Poisson noise: even knowing a customer's rate perfectly,
+whether they *happen* to order in those 30 days is close to a coin flip.
 
-1. **Feature engineering has little room left.** The shipped model captures
-   ~87% of the extractable signal. The derived rate features closed 13% of the
-   gap between raw counts and the ceiling; the remainder is thin.
-2. **Raising the ceiling requires changing the target, not the model.** A longer
-   window, or a definition based on sustained disengagement rather than a single
-   30-day gap, would carry more signal per label. That is a problem-framing
-   change, and it dominates anything available on the modelling side.
+Widening the window changes that:
 
-This is also why the project reports ROC-AUC rather than accuracy as its
-headline.
+| Window | Churn rate | Model AUC | **Ceiling** | Headroom |
+| ---: | ---: | ---: | ---: | ---: |
+| 30 days | 0.646 | 0.6725 | **0.7274** | +0.055 |
+| 60 days | 0.456 | 0.7006 | **0.7690** | +0.068 |
+| 90 days | 0.335 | 0.7306 | **0.8293** | +0.099 |
 
----
+**Reframing the target is worth several times what feature engineering was
+worth.** 30 → 90 days raises the ceiling by **+0.102 AUC**. The best feature
+change in this project — adding the derived rate features — was worth **+0.017**
+(0.6556 → 0.6725), so the target reframing is roughly six times larger, and it
+is available without touching the model at all.
 
-## 11. The Target Window Bug
+Note the headroom *widens* with the window. A longer target does not merely
+make the problem easier — it creates signal the current features do not yet
+exploit, so feature work becomes worthwhile again *after* the target is fixed.
+Order matters.
 
-An earlier version reported a test ROC-AUC of **0.7641** from `src/train.py`
-while the notebook reported **0.7233**, and the README described this as an
-unexplained reproducibility issue. It was not unexplained: `src/features.py` had
-an off-by-one error in the target window.
-
-The generator lays out orders in two blocks — history through 2025-11-30, target
-from 2025-12-01. The old feature code derived its windows independently:
-
-```python
-# before
-historical_orders = orders[orders["order_date"] <  prediction_date]
-future_orders     = orders[(orders["order_date"] >= prediction_date)
-                         & (orders["order_date"] <  prediction_date + 30d)]
-```
-
-That window, `[2025-11-30, 2025-12-30)`, was shifted one day early and did two
-wrong things at once:
-
-1. **Swallowed 2025-11-30** — 42 orders from the historical block were treated
-   as future behaviour and used to build the label.
-2. **Dropped 2025-12-30** — 82 orders from the future block fell outside the
-   window entirely.
-
-61 customers received the wrong label.
-
-```python
-# after
-target_start = prediction_date + pd.Timedelta(days=1)
-target_end   = prediction_date + pd.Timedelta(days=target_window_days)
-
-historical_orders = orders[orders["order_date"] <= prediction_date]
-future_orders     = orders[(orders["order_date"] >= target_start)
-                         & (orders["order_date"] <= target_end)]
-```
-
-Correcting it reproduced the notebook's result to five decimal places,
-confirming the diagnosis. **The inflated 0.7641 was the bug, not the
-achievement** — a mislabelled target made the problem look easier than it is.
-
-The lesson worth keeping: when a notebook and a pipeline disagree, that is a
-defect to diagnose, not a curiosity to document. Window boundaries should come
-from a single anchor and be pinned by tests, because off-by-one errors in date
-filters are silent.
+The catch: a 90-day window answers a slower business question, and you wait 90
+days to learn whether a prediction was right. Whether that trade is worth making
+is a product decision. This analysis supplies the price.
 
 ---
 
-## 12. Project Structure
+## 11. Walk-forward validation
+
+Full analysis: [`notebooks/03_temporal_validation.ipynb`](notebooks/03_temporal_validation.ipynb)
+
+Headline metrics come from a random split at one prediction date. That does not
+answer whether a model trained in January still works in October. Scoring at
+five dates a quarter apart, retrained each time, the problem is **stable** —
+estimates wander a few points and every interval overlaps every other.
+
+Trained once and left alone, a **twelve-month-old model loses about 0.004
+AUC**. That is a real property here, not a bug: each customer's drift is a
+fixed personal trait, so the mapping from history to future behaviour never
+changes.
+
+Which leaves the harness untested. So the generator can inject a
+population-wide shock — every customer's order rate halved from day 550, a
+macro event or a competitor launch:
+
+| Metric | Before shock | After shock |
+| --- | ---: | ---: |
+| ROC-AUC | 0.673 | 0.654 |
+| Brier | 0.206 | **0.167** (improved!) |
+| Predicted churn rate | 0.668 | 0.712 |
+| Actual churn rate | 0.662 | 0.785 |
+| **Calibration error** | +0.006 | **−0.112** |
+
+**ROC-AUC barely notices.** It measures *ordering*, and halving everyone's rate
+leaves the ranking nearly intact while making every probability wrong in
+absolute terms. A monitor watching discrimination alone would have raised
+nothing while the model was mis-stating churn by eleven points — and any
+decision built on a probability, including this project's cost-based threshold,
+is now mis-set.
+
+Worse, **Brier improved**. It is a proper scoring rule but sensitive to the base
+rate, and a base rate moving toward an extreme makes it easier to score well.
+Watched alone it would have suggested the model got *better*.
+
+The cheap signal that caught this: predicted versus actual base rate. Monitor
+calibration, not just discrimination.
+
+---
+
+## 12. Uplift: who should we actually contact?
+
+Full analysis: [`notebooks/04_uplift_modelling.ipynb`](notebooks/04_uplift_modelling.ipynb)
+
+A churn model ranks customers by how likely they are to leave. A retention
+campaign then contacts the top of that list. That step is close to worthless.
+
+The campaign should reach customers whose behaviour the contact *changes*:
+
+| | Contacted | Not contacted |
+| --- | --- | --- |
+| **Sure thing** | stays | stays |
+| **Persuadable** | stays | leaves |
+| **Lost cause** | leaves | leaves |
+| **Sleeping dog** | leaves | stays |
+
+Only persuadables repay the spend; sleeping dogs are actively harmed. A churn
+model ranks by outcome, not responsiveness, and cannot tell them apart.
+Separating them needs randomised data, because responsiveness is causal —
+hence `campaign.csv`, a simulated RCT run after the observational data ends
+(2,503 treated / 2,497 control, ATE **+0.0455**, and 15% of customers have
+negative true uplift).
+
+A T-learner — one outcome model per arm, uplift as their difference:
+
+| Targeting strategy | Qini score |
+| --- | ---: |
+| **Uplift model (T-learner)** | **12.73** |
+| Churn probability | 1.44 |
+| Random | 1.98 |
+| ORACLE (true uplift) | 14.62 |
+
+**Targeting by churn probability scores no better than random.** The model this
+project spent most of its effort on is, as a targeting rule, worthless — while
+the uplift model captures 87% of what the oracle could achieve.
+
+Observed uplift by quintile shows why:
+
+| Quintile | Uplift model | Churn probability |
+| ---: | ---: | ---: |
+| 1 (top) | **+0.125** | +0.010 |
+| 2 | +0.097 | +0.092 |
+| 3 | +0.045 | +0.100 |
+| 4 | −0.024 | −0.018 |
+| 5 | −0.000 | +0.080 |
+
+The uplift model's quintiles decline cleanly and go negative — it found the
+sleeping dogs. The churn model's are not ordered at all. Correlation between
+the two scores is **−0.065**: in this data persuadability is driven by browsing
+relative to buying, while churn risk is driven by order frequency.
+Interested-but-hesitant customers respond to a nudge; customers who simply do
+not buy much are not persuadable, just quiet.
+
+Three consequences: **run the experiment** (uplift cannot be estimated from
+observational data at all); **a churn model is still useful** for forecasting
+revenue at risk and for triage, just not for deciding who to contact; and
+**measure campaigns against a holdout**, since a campaign targeting sure things
+shows excellent retention and achieves nothing.
+
+---
+
+## 13. Project structure
 
 ```text
 customer-churn/
-|
 +-- .github/workflows/ci.yml   test + docker smoke test on every push
-|
 +-- data/                      generated CSVs (not tracked)
 +-- models/
 |   +-- churn_model.joblib     calibrated pipeline (not tracked)
-|   +-- model_card.json        params, metrics, threshold, importances
-|
-+-- notebooks/
-|   +-- 01_data_profiling.ipynb    exploration and model selection
-|   +-- 02_headroom_analysis.ipynb how good can this model get
-|
+|   +-- model_card.json        params, metrics, CIs, threshold, importances
++-- notebooks/                 01 profiling, 02 ceiling, 03 time, 04 uplift
 +-- src/
-|   +-- generate_data.py       synthetic dataset generator
+|   +-- generate_data.py       synthetic data, hidden traits, RCT, shocks
 |   +-- features.py            feature engineering + target construction
-|   +-- train.py               training, calibration, threshold selection
+|   +-- train.py               training, calibration, thresholds, uncertainty
 |   +-- scoring.py             shared contract: paths, features, thresholds
+|   +-- evaluation.py          bootstrap and paired-bootstrap intervals
+|   +-- uplift.py              T-learner, Qini curves, decile diagnostics
 |   +-- predict.py             CLI demo
 |   +-- api.py                 FastAPI service
-|
-+-- tests/
-|   +-- test_generate_data.py
-|   +-- test_features.py
-|   +-- test_model.py
-|   +-- test_api.py
-|
++-- tests/                     73 tests
 +-- Dockerfile
-+-- pytest.ini
-+-- requirements.txt           runtime dependencies
-+-- requirements-dev.txt       runtime + test dependencies
-+-- README.md
++-- requirements.txt / requirements-dev.txt
 ```
-
-`src/scoring.py` exists so the model path, feature lists, derived-feature logic,
-threshold and risk bands are defined once. Before it, `predict.py` reported two
-risk levels and `api.py` reported three.
 
 ---
 
-## 13. Automated Testing
+## 14. Testing
 
 ```bash
 python -m pytest
 ```
 
-Expected: `48 passed`.
+Expected: `73 passed`.
 
-**Generator** — no order or event precedes its customer's signup; tenure and
-order volume are positively related (the regression test for the incoherence
-bug); history and target blocks stay separated; generation is deterministic
-under a seed; deliberate defects survive.
+**Generator** — nothing precedes signup; tenure and volume are positively
+related (regression test for the incoherence bug); the oracle intensity
+reproduces realised volume within 15%; the campaign is balanced, shows a
+positive ATE, contains sleeping dogs, and its uplift is uncorrelated with churn
+risk; shocks affect only days after them.
 
-**Feature engineering** — expected columns, target construction, binary labels,
-unique rows, no missing values in count features, sentinel imputation, four
-boundary tests plus a sweep asserting the history and target windows never
-overlap and never leave a gap.
+**Features** — expected columns, binary labels, unique rows, sentinel
+imputation, four boundary cases plus a −2…+32 day sweep asserting the windows
+never overlap and never gap.
 
-**Model** — artifact loads, probabilities in range, the pipeline accepts only
-documented input columns, batch and single scoring agree, risk bands are
-reachable and never contradict the prediction at any threshold, derived features
-survive zero denominators and do not mutate their input, a missing artifact
-raises an actionable error.
+**Evaluation** — intervals bracket point estimates and narrow with more data;
+paired tests are directional, detect real differences, and resolve a case where
+comparing overlapping intervals fails.
 
-**API** — health, single predict, batch predict (including empty and oversized
-rejection), `/model`, request-ID headers, internal consistency, and rejection of
-malformed, missing, negative and injected-derived-feature input.
+**Uplift** — the T-learner recovers the uplift ordering; Qini ranks strategies
+correctly; random targeting centres on zero across 40 draws while a genuine
+ranking beats every draw.
 
----
-
-## 14. Training
-
-```bash
-python src/train.py
-```
-
-Loads data, builds features, splits, runs a 5-fold cross-validated grid search,
-calibrates, sweeps the cost scenarios to pick an operating threshold, evaluates
-against the baseline, computes permutation importances, and writes both
-`churn_model.joblib` and `model_card.json`.
-
-The script asserts no target-derived column reaches the feature matrix, and
-exits with an actionable message if the input CSVs are missing.
+**Model / API** — artifact loading, batch/single agreement, risk bands
+reachable and never contradicting predictions at any threshold, and rejection
+of malformed, missing, negative and injected input.
 
 ---
 
-## 15. Local Prediction
-
-```bash
-python src/predict.py
-```
-
----
-
-## 16. FastAPI
+## 15. API
 
 ```bash
 python -m uvicorn src.api:app --reload
 ```
 
-Interactive documentation: `http://127.0.0.1:8000/docs`
+Docs at `http://127.0.0.1:8000/docs`. Every response carries an `X-Request-ID`;
+each request is logged with method, path, status and duration.
 
-Every response carries an `X-Request-ID` header, and each request is logged with
-its method, path, status and duration.
+- **`GET /health`** — `{"status": "healthy", "model_loaded": true}`. If the
+  artifact is missing the service still starts but returns `503`, so the
+  container is visibly unhealthy for the right reason rather than
+  crash-looping.
+- **`GET /model`** — serves the model card.
+- **`POST /predict`** — 13 fields in, `{churn_probability, predicted_churn,
+  risk_level}` out.
+- **`POST /predict/batch`** — same schema in `{"customers": [...]}`, 1–1000 per
+  call.
 
-### `GET /health`
-
-```json
-{ "status": "healthy", "model_loaded": true }
-```
-
-If the artifact is missing or unreadable the service still starts but returns
-`503` with `"status": "unhealthy"` and a message explaining how to build it. The
-container becomes visibly unhealthy for the correct reason instead of
-crash-looping on an import-time traceback.
-
-### `GET /model`
-
-Serves `model_card.json`: hyperparameters, calibration method, operating
-threshold, cost model, metrics, reliability table and permutation importances.
-
-### `POST /predict`
-
-```json
-{
-  "age": 35, "country": "DE",
-  "total_orders": 2, "total_spent": 150,
-  "days_since_last_order": 75, "has_previous_order": 1,
-  "total_events": 5, "add_to_cart_count": 1, "checkout_count": 0,
-  "login_count": 2, "product_view_count": 2,
-  "tenure_days": 180, "events_last_30_days": 0
-}
-```
-
-Response:
-
-```json
-{ "churn_probability": 0.6773, "predicted_churn": 0, "risk_level": "LOW" }
-```
-
-### `POST /predict/batch`
-
-Same schema wrapped in `{"customers": [...]}`, 1 to 1000 per call. Returns
-`{"predictions": [...], "count": n}`.
-
-**Note on `days_since_last_order`:** for a customer who has never ordered, pass
-`tenure_days`. That is how the training data encodes it; passing `0` would
-describe a customer who ordered today.
+For a customer who has never ordered, pass `tenure_days` as
+`days_since_last_order` — that is how the training data encodes it.
 
 ---
 
-## 17. Docker
-
-Train the model first — the image copies `models/` at build time.
+## 16. Docker and CI
 
 ```bash
 python src/train.py
@@ -678,96 +536,54 @@ docker build -t customer-churn:latest .
 docker run -d --name customer-churn-api -p 8000:8000 customer-churn:latest
 ```
 
-The image runs as a non-root user (`appuser`, uid 10001) and includes a health
-check against `/health`. Test dependencies are not installed in the runtime
-image.
+Runs as non-root (`appuser`, uid 10001), with a health check against `/health`.
+Test dependencies are not installed in the runtime image.
+
+`.github/workflows/ci.yml` runs on every push: install → generate → train → run
+the suite → validate the model card, then a second job builds the image, starts
+the container, polls `/health` and smoke-tests `/predict`.
 
 ---
 
-## 18. Continuous Integration
+## 17. Limitations
 
-`.github/workflows/ci.yml` runs on every push and pull request:
+**Synthetic data.** The relationship between history and future is one the
+generator was written to contain. The *method* of measuring a ceiling
+transfers; the number does not.
 
-1. **test** — install, generate data, train, run the full suite, verify the
-   model card is valid JSON, upload it as a build artifact.
-2. **docker** — build the image, start the container, poll `/health` until
-   ready, smoke-test `/health` and `/predict`, dump container logs.
+**Small test splits.** 663 rows gives a ±0.04 interval on AUC. Every headline
+number carries one for that reason.
 
-The training step is what makes the run meaningful: without a model artifact the
-model-dependent tests would skip rather than run.
+**Threshold economics are invented.** The sensitivity table shows how much the
+answer depends on them, which is the point.
 
----
+**Uplift is estimated from one simulated campaign** with a deterministic link
+from `browse_bias` to true uplift. Real uplift is noisier and the achievable
+Spearman correlation would be lower than the 0.28 seen here.
 
-## 19. AWS Deployment
+**Stationary process.** Per-customer drift is a fixed trait, so nothing decays
+without an injected shock. Real populations shift in ways this does not model.
 
-The containerized API was deployed to an Amazon EC2 instance running the same
-image tested locally, verified through `GET /health` and `POST /predict`.
-
-```text
-Internet --> :8000 --> EC2 --> Docker --> FastAPI --> Model
-```
+**No seasonality**, and a single geography-agnostic model.
 
 ---
 
-## 20. Security Considerations
+## 18. Future work
 
-A portfolio demonstration, not a hardened service.
-
-- SSH restricted to the administrator's IP; `.pem` files excluded from git
-- Container runs as a non-root user
-- Model artifact and generated data excluded from git
-- Request logging with correlation IDs
-
-Production would additionally need HTTPS, a reverse proxy, authentication and
-authorization, restricted network access, secrets management, versioned model
-storage, monitoring, and rate limiting.
-
----
-
-## 21. Limitations
-
-**Synthetic data.** The relationship between history and future behaviour is one
-the generator was written to contain. The measured ceiling of 0.7575 is a
-property of that design, not evidence about real customers. The *method* of
-measuring a ceiling transfers; the number does not.
-
-**Model performance.** ROC-AUC 0.7231 against a 0.7575 ceiling. Useful ranking,
-and close to the limit of this target definition.
-
-**Threshold economics are illustrative.** The margin, acceptance rate and offer
-costs are invented. The sensitivity table shows how much the answer depends on
-them, which is the point.
-
-**Random split, not temporal.** Train/validation/test are split randomly at a
-single prediction date. Production would validate across multiple prediction
-dates in time order.
-
-**Single prediction date.** The model has never been tested for stability across
-different times of year.
-
-**Calibration is measured on 623 validation rows.** The reliability table's
-lowest bin holds 2 customers, so the fit at the extremes is not well determined.
+1. **Adopt a longer target window** — the only change that raises the ceiling,
+   worth ~+0.10 AUC.
+2. **Ship the uplift model as the targeting rule**, keeping the churn model for
+   forecasting.
+3. **Monitor calibration in production**, not just discrimination — §11 shows
+   why.
+4. Sequence/recency models (e.g. BG/NBD) that model the Poisson process
+   directly rather than approximating it with tabular aggregates.
+5. Model registry with versioning and rollback; HTTPS, authentication, rate
+   limiting; production database in place of CSVs.
 
 ---
 
-## 22. Future Improvements
-
-Ordered by expected value, informed by
-[section 10](#10-how-good-can-this-model-possibly-get):
-
-1. **A better-framed target** — longer window, or sustained disengagement rather
-   than a single 30-day gap. This raises the ceiling; nothing else does.
-2. **Time-based cross-validation** across multiple prediction dates.
-3. **Drift monitoring** on inputs and predictions, with automated retraining.
-4. **Uplift modelling** — target customers whose behaviour the intervention
-   would *change*, rather than those most likely to churn.
-5. Cloud model registry with versioning and rollback.
-6. HTTPS, authentication, rate limiting.
-7. Production database integration in place of CSVs.
-
----
-
-## 23. Technologies
+## 19. Technologies
 
 Python, pandas, NumPy, scikit-learn, FastAPI, Uvicorn, pytest, Docker, GitHub
 Actions, AWS EC2, Git / GitHub.
