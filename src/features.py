@@ -17,7 +17,8 @@ import pandas as pd
 
 # The last day of observed history, inclusive. Everything on or before this
 # date is knowable at prediction time; everything after it is the target.
-PREDICTION_DATE = pd.Timestamp("2025-11-30")
+# Kept in step with PREDICTION_DAY in src/generate_data.py.
+PREDICTION_DATE = pd.Timestamp("2025-12-31")
 
 # Length of the target window, in days.
 TARGET_WINDOW_DAYS = 30
