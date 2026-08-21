@@ -37,7 +37,7 @@ Data and model artifacts are not tracked in git, so build them first:
 ```bash
 python src/generate_data.py     # writes data/*.csv
 python src/train.py             # writes models/churn_model.joblib + model_card.json
-python -m pytest                # 73 passed
+python -m pytest                # 103 passed
 ```
 
 Then score a customer, or start the API:
@@ -46,6 +46,8 @@ Then score a customer, or start the API:
 python src/predict.py
 python -m uvicorn src.api:app --reload
 ```
+
+Then open **http://127.0.0.1:8000** for the dashboard.
 
 Tests that need the model artifact skip with an explanatory message rather than
 failing if you have not run `train.py` yet.
@@ -461,11 +463,13 @@ customer-churn/
 |   +-- features.py            feature engineering + target construction
 |   +-- train.py               training, calibration, thresholds, uncertainty
 |   +-- scoring.py             shared contract: paths, features, thresholds
+|   +-- feature_store.py       features and scores keyed by customer id
 |   +-- evaluation.py          bootstrap and paired-bootstrap intervals
 |   +-- uplift.py              T-learner, Qini curves, decile diagnostics
 |   +-- predict.py             CLI demo
 |   +-- api.py                 FastAPI service
-+-- tests/                     73 tests
+|   +-- static/index.html      dashboard (no build step)
++-- tests/                     103 tests
 +-- Dockerfile
 +-- requirements.txt / requirements-dev.txt
 ```
@@ -478,7 +482,7 @@ customer-churn/
 python -m pytest
 ```
 
-Expected: `73 passed`.
+Expected: `103 passed`.
 
 **Generator** — nothing precedes signup; tenure and volume are positively
 related (regression test for the incoherence bug); the oracle intensity
@@ -502,31 +506,96 @@ ranking beats every draw.
 reachable and never contradicting predictions at any threshold, and rejection
 of malformed, missing, negative and injected input.
 
+**Feature store / dashboard** — every eligible customer is scored; lookups
+agree with raw-feature scoring for the same customer; filters, sorting and
+pagination behave; expected-churners and flagged-for-contact stay distinct;
+drivers sort by absolute effect and a customer sitting at the median gets
+near-zero contribution from that feature.
+
 ---
 
-## 15. API
+## 15. API and dashboard
 
 ```bash
 python -m uvicorn src.api:app --reload
 ```
 
-Docs at `http://127.0.0.1:8000/docs`. Every response carries an `X-Request-ID`;
-each request is logged with method, path, status and duration.
+- **http://127.0.0.1:8000** — the dashboard
+- **http://127.0.0.1:8000/docs** — the OpenAPI contract
 
-- **`GET /health`** — `{"status": "healthy", "model_loaded": true}`. If the
-  artifact is missing the service still starts but returns `503`, so the
-  container is visibly unhealthy for the right reason rather than
-  crash-looping.
-- **`GET /model`** — serves the model card.
-- **`POST /predict`** — 13 fields in, `{churn_probability, predicted_churn,
-  risk_level}` out.
-- **`POST /predict/batch`** — same schema in `{"customers": [...]}`, 1–1000 per
-  call.
+### Two ways in, and why
 
-For a customer who has never ordered, pass `tenure_days` as
-`days_since_last_order` — that is how the training data encodes it.
+`/docs` is a developer tool. It exists so an engineer can read the contract and
+poke at it; no business user opens Swagger to ask whether a customer is at
+risk. The dashboard is the surface a retention manager actually uses.
 
----
+The endpoints themselves come in two shapes, and the distinction matters more
+than the UI:
+
+| | Takes | Use for |
+| --- | --- | --- |
+| `GET /customers/{id}` | a customer id | everything normal |
+| `POST /predict` | 13 raw features | what-if analysis only |
+
+`/predict` asks the caller to supply pre-computed features, which means
+reimplementing `build_features` exactly — the same windows, the same
+imputation, the same definitions. Any drift between their version and ours
+silently corrupts every prediction: nothing errors, the numbers are just
+quietly wrong. That is textbook training/serving skew.
+
+`/customers/{id}` avoids it by keying on an identifier. Features are computed
+once, by the same code that produced the training set, and looked up at serve
+time. `src/feature_store.py` is a deliberately simple in-memory version of what
+Feast, Tecton or a warehouse table would do in production; the interface is the
+part that matters. A test asserts the two paths agree on any given customer.
+
+### Endpoints
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /` | dashboard |
+| `GET /health` | service state, including whether the feature store loaded |
+| `GET /model` | the model card |
+| `GET /summary` | portfolio view: risk bands, expected churners, revenue at risk |
+| `GET /customers` | ranked worklist; filter by `risk_level`, `country`, `q`; sort by `risk`, `spend`, `orders`, `recency`; paginated |
+| `GET /customers/{id}` | profile, stored features, current score |
+| `GET /customers/{id}/drivers` | what is pushing that score up or down |
+| `POST /predict` | score raw features (what-if) |
+| `POST /predict/batch` | up to 1000 at once |
+
+Every response carries an `X-Request-ID`, and each request is logged with
+method, path, status and duration.
+
+### The dashboard
+
+Single self-contained HTML file, no build step and no external dependencies, so
+it ships inside the same container as the API.
+
+It opens on the whole base — how many customers sit in each risk band, how many
+are flagged for contact at the current threshold, and the revenue those
+probabilities put at risk. Below that is a ranked worklist: riskiest first,
+filterable by band and country, searchable by id. Clicking a customer shows
+their score, where they rank, their history, and what is driving the number.
+
+Two deliberate choices worth calling out.
+
+**Expected churners and flagged-for-contact are shown separately.** The first
+is the sum of calibrated probabilities, the second is the count above the
+operating threshold. They answer different questions — how many will leave
+versus how many to act on — and reporting one as the other is a common and
+expensive mistake.
+
+**Risk drivers are labelled as what they are.** They come from one-at-a-time
+ablation against the population median: re-score the customer with a single
+feature replaced by the typical value, and report how far the probability
+moves. That is not SHAP. It ignores interactions, does not sum to the
+prediction, and over-credits correlated features. It is cheap and directionally
+honest, which is the right trade for triaging a worklist — and the UI says so
+rather than implying more rigour than the method has.
+
+For a customer who has never ordered, `/predict` expects `tenure_days` as
+`days_since_last_order` — that is how the training data encodes it. Looking the
+customer up avoids having to know that at all, which is rather the point.
 
 ## 16. Docker and CI
 
