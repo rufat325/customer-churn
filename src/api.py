@@ -25,7 +25,7 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -35,6 +35,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.feature_store import FeatureStore, StoreNotAvailable
+from src.security import (
+    auth_enabled,
+    check_api_key,
+    check_password,
+    check_rate_limit,
+    client_ip,
+)
 from src.scoring import (
     ModelNotAvailable,
     churn_threshold,
@@ -103,6 +110,29 @@ app = FastAPI(
         "for what-if analysis. A dashboard is served at /."
     ),
 )
+
+
+@app.middleware("http")
+async def enforce_limits(request: Request, call_next):
+    """Rate limit every request, and apply auth when it is configured."""
+
+    try:
+        check_password(request)
+        remaining, _ = check_rate_limit(request)
+    except HTTPException as rejection:
+        logger.warning(
+            "rejected ip=%s path=%s status=%d",
+            client_ip(request), request.url.path, rejection.status_code,
+        )
+        return JSONResponse(
+            status_code=rejection.status_code,
+            content={"detail": rejection.detail},
+            headers=rejection.headers or {},
+        )
+
+    response = await call_next(request)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+    return response
 
 
 @app.middleware("http")
@@ -227,6 +257,7 @@ def health():
         "model_loaded": True,
         "feature_store_loaded": store is not None,
         "customers_scored": len(store) if store else 0,
+        "protection": auth_enabled(),
     }
 
 
@@ -328,7 +359,8 @@ def get_drivers(customer_id: int, top: int = Query(5, ge=1, le=10)):
 # Raw-feature scoring -- for what-if analysis
 # ============================================================
 
-@app.post("/predict", response_model=Prediction)
+@app.post("/predict", response_model=Prediction,
+          dependencies=[Depends(check_api_key)])
 def predict(customer: Customer):
     if model is None:
         return _no_model()
@@ -336,7 +368,8 @@ def predict(customer: Customer):
     return score_batch(model, [customer.model_dump()], threshold)[0]
 
 
-@app.post("/predict/batch", response_model=BatchPrediction)
+@app.post("/predict/batch", response_model=BatchPrediction,
+          dependencies=[Depends(check_api_key)])
 def predict_batch(batch: CustomerBatch):
     if model is None:
         return _no_model()

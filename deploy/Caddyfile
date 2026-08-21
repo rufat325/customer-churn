@@ -1,0 +1,32 @@
+# Caddy terminates TLS and proxies to the API container.
+#
+# SITE_ADDRESS decides whether you get a real certificate. Set it to a
+# hostname Let's Encrypt can validate and HTTPS is automatic, with renewal.
+# Set it to :80 and you get plain HTTP, which browsers increasingly flag and
+# which would send HTTP Basic credentials in the clear.
+#
+# No domain? A wildcard DNS service resolves an IP-derived hostname to that
+# IP, so 1-2-3-4.nip.io points at 1.2.3.4 with no registration and no DNS
+# setup, and Let's Encrypt will issue for it.
+
+{$SITE_ADDRESS::80} {
+	encode gzip
+
+	# The API is not published on the host, so this proxy is the only way
+	# in. That is what makes the X-Forwarded-For header the rate limiter
+	# trusts actually trustworthy: nothing can reach the app directly to
+	# forge it.
+	reverse_proxy api:8000
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

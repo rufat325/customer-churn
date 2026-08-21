@@ -1,0 +1,53 @@
+# Public deployment: Caddy on 80/443, the API reachable only through it.
+#
+#   SITE_ADDRESS=1-2-3-4.nip.io docker compose -f deploy/docker-compose.yml up -d
+#
+# Note there is no `ports:` on the api service. That is deliberate. Publishing
+# it would let anyone bypass the proxy, which both skips TLS and lets them
+# forge the X-Forwarded-For header the rate limiter reads.
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: customer-churn:latest
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      # Requests per minute per client IP.
+      CHURN_RATE_LIMIT: "${CHURN_RATE_LIMIT:-120}"
+      # Leave empty for an open demo. Set to require a login on everything.
+      CHURN_PASSWORD: "${CHURN_PASSWORD:-}"
+      CHURN_USERNAME: "${CHURN_USERNAME:-demo}"
+      # Set to require X-API-Key on the scoring endpoints only.
+      CHURN_API_KEY: "${CHURN_API_KEY:-}"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Compose default syntax is ${VAR:-default}; the default here is
+      # literally ":80", i.e. plain HTTP when no hostname is supplied.
+      SITE_ADDRESS: "${SITE_ADDRESS:-:80}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
