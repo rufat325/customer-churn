@@ -43,6 +43,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.evaluation import bootstrap_metric, format_ci, paired_bootstrap
 from src.features import PREDICTION_DATE, TARGET_WINDOW_DAYS, build_features
 from src.scoring import (
     CATEGORICAL_FEATURES,
@@ -443,6 +444,34 @@ def main() -> int:
     # Permutation importance
     # --------------------------------------------------------------
 
+    # --------------------------------------------------------------
+    # Uncertainty
+    # --------------------------------------------------------------
+    # A point estimate off 600-odd rows is not a four-significant-figure
+    # number. Report the interval, and compare models with a paired test on
+    # identical rows rather than by eyeballing whether two intervals overlap.
+
+    auc_ci = bootstrap_metric(y_test.to_numpy(), test_prob)
+
+    # The obvious business rule: rank by how long since they last ordered.
+    # If the model cannot beat this, it is not earning its complexity.
+    recency_score = X_test["days_since_last_order"].to_numpy()
+    recency_ci = bootstrap_metric(y_test.to_numpy(), recency_score)
+
+    versus_recency = paired_bootstrap(
+        y_test.to_numpy(), recency_score, test_prob
+    )
+
+    print()
+    print("Test ROC-AUC with 95% bootstrap confidence intervals:")
+    print(f"  model              {format_ci(auc_ci, 4)}")
+    print(f"  recency heuristic  {format_ci(recency_ci, 4)}")
+    print(f"  difference         {format_ci(versus_recency, 4)}"
+          f"   model wins {versus_recency['win_rate']:.1%} of resamples")
+    print("  -> difference is "
+          + ("significant" if versus_recency["significant"] else "NOT significant")
+          + " at the 5% level")
+
     print()
     print("Permutation importance (validation, drop in ROC-AUC):")
 
@@ -496,6 +525,11 @@ def main() -> int:
             "contact_everyone": contact_all_test,
             "threshold_0.50": default_test,
             "threshold_tuned": tuned_test,
+        },
+        "uncertainty_test": {
+            "roc_auc": auc_ci,
+            "recency_heuristic_roc_auc": recency_ci,
+            "model_minus_recency": versus_recency,
         },
         "metrics": {
             "validation": model_val,
