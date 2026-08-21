@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from src.feature_store import DATA_DIR, FeatureStore, StoreNotAvailable
+from src.feature_store import DATA_DIR, SNAPSHOT_PATH, FeatureStore, StoreNotAvailable
 from src.scoring import FEATURE_COLUMNS, MODEL_PATH, load_model
 
 
@@ -31,8 +31,12 @@ def store(model):
 
 
 def test_missing_data_raises_actionable_error(model, tmp_path):
+    # snapshot_path=None forces the build-from-CSV path. Without it the
+    # store would load the shipped snapshot and never look at data_dir --
+    # which is the correct production behaviour, and not what this test is
+    # about.
     with pytest.raises(StoreNotAvailable, match="generate_data"):
-        FeatureStore.load(model, data_dir=tmp_path)
+        FeatureStore.load(model, data_dir=tmp_path, snapshot_path=None)
 
 
 @requires_store
@@ -241,3 +245,60 @@ def test_high_risk_customers_have_risk_raising_drivers(store, model):
     # The top-ranked customer got there somehow; at least one feature must
     # be pushing their score up.
     assert any(d["contribution"] > 0 for d in drivers)
+
+
+# ---------------------------------------------------------------------
+# Snapshot
+# ---------------------------------------------------------------------
+# The serving container ships a scored snapshot rather than the raw order
+# and event history. Regression test for a real deployment bug: the image
+# excluded data/ (correctly -- it is the warehouse), which left the
+# dashboard and every customer endpoint dead in the container while the
+# health check still reported the model loaded.
+
+
+@requires_store
+def test_snapshot_round_trips(store, model, tmp_path):
+    path = store.save(tmp_path / "snapshot.csv")
+
+    assert path.exists()
+
+    reloaded = FeatureStore.load(model, snapshot_path=path)
+
+    assert len(reloaded) == len(store)
+
+    customer_id = store.list_customers(limit=1)["customers"][0]["customer_id"]
+
+    assert reloaded.profile(customer_id) == store.profile(customer_id)
+
+
+@requires_store
+def test_snapshot_loads_without_any_raw_data(model, tmp_path):
+    # The whole point: given a snapshot, the store must not need data_dir at
+    # all. Pointing it at an empty directory proves it.
+    snapshot = FeatureStore.load(model, snapshot_path=None).save(
+        tmp_path / "snapshot.csv"
+    )
+
+    empty = tmp_path / "no-data"
+    empty.mkdir()
+
+    store = FeatureStore.load(model, data_dir=empty, snapshot_path=snapshot)
+
+    assert len(store) > 1000
+    assert store.summary()["total_customers"] == len(store)
+
+
+@requires_store
+def test_missing_snapshot_falls_back_to_building_from_csvs(model, tmp_path):
+    store = FeatureStore.load(model, snapshot_path=tmp_path / "absent.csv")
+
+    assert len(store) > 1000
+
+
+@requires_store
+def test_training_writes_a_snapshot_next_to_the_model():
+    # train.py writes it into models/, which is what the Dockerfile already
+    # copies -- so no Dockerfile change was needed to ship it.
+    assert SNAPSHOT_PATH.exists()
+    assert SNAPSHOT_PATH.parent.name == "models"

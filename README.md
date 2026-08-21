@@ -37,7 +37,7 @@ Data and model artifacts are not tracked in git, so build them first:
 ```bash
 python src/generate_data.py     # writes data/*.csv
 python src/train.py             # writes models/churn_model.joblib + model_card.json
-python -m pytest                # 119 passed
+python -m pytest                # 123 passed
 ```
 
 Then score a customer, or start the API:
@@ -457,6 +457,7 @@ customer-churn/
 +-- models/
 |   +-- churn_model.joblib     calibrated pipeline (not tracked)
 |   +-- model_card.json        params, metrics, CIs, threshold, importances
+|   +-- feature_snapshot.csv   scored customer base, shipped in the image
 +-- notebooks/                 01 profiling, 02 ceiling, 03 time, 04 uplift
 +-- src/
 |   +-- generate_data.py       synthetic data, hidden traits, RCT, shocks
@@ -472,7 +473,7 @@ customer-churn/
 |   +-- static/index.html      dashboard (no build step)
 +-- deploy/                    docker-compose + Caddy (HTTPS)
 +-- DEPLOYMENT.md              how it is deployed, and how to lock it down
-+-- tests/                     119 tests
++-- tests/                     123 tests
 +-- Dockerfile
 +-- requirements.txt / requirements-dev.txt
 ```
@@ -485,7 +486,7 @@ customer-churn/
 python -m pytest
 ```
 
-Expected: `119 passed`.
+Expected: `123 passed`.
 
 **Generator** — nothing precedes signup; tenure and volume are positively
 related (regression test for the incoherence bug); the oracle intensity

@@ -34,6 +34,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DATA_DIR = PROJECT_ROOT / "data"
 
+# A scored snapshot, written by train.py and shipped in the image alongside
+# the model. The serving container should not carry the raw order and event
+# history: it is the warehouse, it is far larger than the features derived
+# from it, and nothing at serve time needs it. Shipping the snapshot instead
+# also means startup is a file read rather than a full feature build.
+SNAPSHOT_PATH = PROJECT_ROOT / "models" / "feature_snapshot.csv"
+
+SNAPSHOT_DATE_COLUMNS = ["signup_date", "last_order_date"]
+
 # Columns describing who the customer is, as opposed to model inputs.
 PROFILE_COLUMNS = ["customer_id", "age", "country", "signup_date"]
 
@@ -73,14 +82,32 @@ class FeatureStore:
     # ------------------------------------------------------------------
 
     @classmethod
-    def load(cls, model, data_dir: Path = DATA_DIR) -> "FeatureStore":
+    def load(
+        cls,
+        model,
+        data_dir: Path = DATA_DIR,
+        snapshot_path: Path | None = SNAPSHOT_PATH,
+    ) -> "FeatureStore":
         """
-        Build features for every eligible customer and score them once.
+        Load the scored customer base.
 
-        Scoring the whole base at startup is what makes a ranked worklist
-        possible: the useful question is "who are my 50 riskiest customers",
-        and that cannot be answered one lookup at a time.
+        Prefers a snapshot written by train.py; falls back to building from
+        the raw CSVs, which is what happens in local development and what
+        produces the snapshot in the first place.
+
+        Either way the whole base is scored up front, because the useful
+        question is "who are my 50 riskiest customers" and that cannot be
+        answered one lookup at a time.
         """
+
+        if snapshot_path is not None and snapshot_path.exists():
+            frame = pd.read_csv(snapshot_path)
+
+            for column in SNAPSHOT_DATE_COLUMNS:
+                if column in frame.columns:
+                    frame[column] = pd.to_datetime(frame[column])
+
+            return cls(frame, churn_threshold())
 
         paths = {
             name: data_dir / f"{name}.csv"
@@ -121,6 +148,14 @@ class FeatureStore:
         )
 
         return cls(frame, threshold)
+
+    def save(self, snapshot_path: Path = SNAPSHOT_PATH) -> Path:
+        """Write the scored frame so a serving container can skip the build."""
+
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        self._frame.to_csv(snapshot_path, index=False)
+
+        return snapshot_path
 
     # ------------------------------------------------------------------
     # Lookups

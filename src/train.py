@@ -558,9 +558,16 @@ def main() -> int:
         json.dumps(card, indent=2) + "\n", encoding="utf-8"
     )
 
+    # Score the whole base and ship the result with the model, so the
+    # serving container never needs the raw order and event history.
+    from src.feature_store import FeatureStore
+
+    snapshot_path = FeatureStore.load(model, snapshot_path=None).save()
+
     print()
     print(f"Model saved to:      {MODEL_PATH}")
     print(f"Model card saved to: {MODEL_CARD_PATH}")
+    print(f"Feature snapshot:    {snapshot_path}")
 
     example = X_test.iloc[0].to_dict()
     print()
