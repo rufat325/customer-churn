@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Churn Risk Console</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --border: #e3e6ea;
+    --text: #16191d;
+    --muted: #697180;
+    --accent: #2f6fed;
+    --high: #d6455b;
+    --medium: #d38b1f;
+    --low: #2e9e6b;
+    --shadow: 0 1px 2px rgba(16,19,29,.06), 0 4px 12px rgba(16,19,29,.05);
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --panel: #171b21; --border: #262c35;
+      --text: #e8ebef; --muted: #939cab; --accent: #6394f7;
+      --high: #f0687c; --medium: #e6a63f; --low: #4bbd88;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 18px 24px; border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -.01em; }
+  header .sub { color: var(--muted); font-size: 12.5px; }
+  header .spacer { flex: 1; }
+  .chip {
+    font: 11.5px/1 var(--mono); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px; padding: 5px 10px;
+  }
+  main { padding: 20px 24px 40px; max-width: 1500px; margin: 0 auto; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px 16px; box-shadow: var(--shadow);
+  }
+  .card .label { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; }
+  .card .value { font-size: 22px; font-weight: 640; margin-top: 5px; letter-spacing: -.02em; }
+  .card .note { color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+
+  .layout { display: grid; grid-template-columns: minmax(0,1.15fr) minmax(0,1fr); gap: 16px; margin-top: 16px; }
+  @media (max-width: 1080px) { .layout { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+  }
+  .panel > h2 {
+    margin: 0; padding: 13px 16px; font-size: 13px; font-weight: 620;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .panel > h2 .count { color: var(--muted); font-weight: 450; font-size: 12px; }
+
+  .controls { display: flex; gap: 8px; padding: 12px 16px; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+  input, select, button {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px;
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  input[type=search] { flex: 1; min-width: 130px; }
+  button { cursor: pointer; background: var(--panel); }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+
+  .scroll { max-height: 560px; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 16px; border-bottom: 1px solid var(--border); }
+  th {
+    position: sticky; top: 0; background: var(--panel); z-index: 1;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); font-weight: 600;
+  }
+  td.num, th.num { text-align: right; font-family: var(--mono); font-size: 12.5px; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+  tbody tr[aria-selected="true"] { background: color-mix(in srgb, var(--accent) 13%, transparent); }
+
+  .band { font-weight: 640; font-size: 11.5px; letter-spacing: .03em; }
+  .band.HIGH { color: var(--high); }
+  .band.MEDIUM { color: var(--medium); }
+  .band.LOW { color: var(--low); }
+
+  .bar { height: 5px; border-radius: 3px; background: color-mix(in srgb, var(--muted) 22%, transparent); overflow: hidden; margin-top: 4px; }
+  .bar > span { display: block; height: 100%; border-radius: 3px; }
+
+  .detail { padding: 16px; }
+  .placeholder { padding: 52px 20px; text-align: center; color: var(--muted); }
+
+  .score-row { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+  .gauge { flex: 0 0 auto; }
+  .score-meta h3 { margin: 0 0 3px; font-size: 19px; letter-spacing: -.02em; }
+  .score-meta .line { color: var(--muted); font-size: 12.5px; }
+
+  .section-title {
+    margin: 20px 0 9px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .05em; color: var(--muted); font-weight: 600;
+  }
+  .driver { margin-bottom: 11px; }
+  .driver .top { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px; }
+  .driver .name { font-weight: 560; }
+  .driver .val { font-family: var(--mono); color: var(--muted); font-size: 12px; }
+  .track { position: relative; height: 7px; margin-top: 5px; background: color-mix(in srgb, var(--muted) 18%, transparent); border-radius: 4px; }
+  .track .mid { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--border); }
+  .track .fill { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
+
+  .kv { display: grid; grid-template-columns: 1fr auto; gap: 3px 14px; font-size: 12.5px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; text-align: right; }
+
+  .note-box {
+    margin-top: 18px; padding: 10px 12px; border-radius: 8px; font-size: 12px;
+    color: var(--muted); background: var(--bg); border: 1px solid var(--border);
+  }
+  .error { padding: 16px; color: var(--high); font-size: 13px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Churn Risk Console</h1>
+  <span class="sub" id="asof">loading…</span>
+  <span class="spacer"></span>
+  <span class="chip" id="modelchip">model…</span>
+  <a class="chip" href="/docs">API docs</a>
+</header>
+
+<main>
+  <section class="cards" id="cards"></section>
+
+  <div class="layout">
+    <section class="panel">
+      <h2>Customers <span class="count" id="listcount"></span></h2>
+      <div class="controls">
+        <input type="search" id="q" placeholder="Search customer id…" autocomplete="off">
+        <select id="risk">
+          <option value="">All risk bands</option>
+          <option value="HIGH">High only</option>
+          <option value="MEDIUM">Medium only</option>
+          <option value="LOW">Low only</option>
+        </select>
+        <select id="country"><option value="">All countries</option></select>
+        <select id="sort">
+          <option value="risk">Riskiest first</option>
+          <option value="risk_asc">Safest first</option>
+          <option value="spend">Highest spend</option>
+          <option value="orders">Most orders</option>
+          <option value="recency">Longest since order</option>
+        </select>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Customer</th><th>Country</th>
+              <th class="num">Churn risk</th><th>Band</th>
+              <th class="num">Orders</th><th class="num">Spent</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div class="controls" style="border-top:1px solid var(--border);border-bottom:none">
+        <button id="more">Load more</button>
+        <span class="chip" id="shown"></span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Customer detail</h2>
+      <div id="detail" class="placeholder">Select a customer to see their churn risk.</div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const pct = x => (x * 100).toFixed(1) + '%';
+const money = x => x.toLocaleString(undefined, {maximumFractionDigits: 0});
+
+let state = {offset: 0, total: 0, selected: null, population: 0};
+
+async function api(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  return r.json();
+}
+
+function bandColor(band) {
+  return band === 'HIGH' ? 'var(--high)' : band === 'MEDIUM' ? 'var(--medium)' : 'var(--low)';
+}
+
+function gauge(p, band) {
+  const r = 42, c = 2 * Math.PI * r, on = c * p;
+  return `<svg class="gauge" width="108" height="108" viewBox="0 0 108 108" role="img"
+      aria-label="Churn probability ${pct(p)}">
+    <circle cx="54" cy="54" r="${r}" fill="none" stroke="color-mix(in srgb, var(--muted) 20%, transparent)" stroke-width="9"/>
+    <circle cx="54" cy="54" r="${r}" fill="none" stroke="${bandColor(band)}" stroke-width="9"
+      stroke-linecap="round" stroke-dasharray="${on} ${c - on}" transform="rotate(-90 54 54)"/>
+    <text x="54" y="52" text-anchor="middle" font-size="21" font-weight="650" fill="var(--text)">${(p*100).toFixed(0)}%</text>
+    <text x="54" y="68" text-anchor="middle" font-size="10" fill="var(--muted)">churn risk</text>
+  </svg>`;
+}
+
+async function loadSummary() {
+  const s = await api('/summary');
+  state.population = s.total_customers;
+  $('asof').textContent = `as of ${s.prediction_date} · ${s.total_customers.toLocaleString()} customers scored`;
+
+  const rc = s.risk_counts;
+  $('cards').innerHTML = `
+    <div class="card"><div class="label">High risk</div>
+      <div class="value" style="color:var(--high)">${rc.HIGH.toLocaleString()}</div>
+      <div class="note">${pct(rc.HIGH / s.total_customers)} of base</div></div>
+    <div class="card"><div class="label">Medium risk</div>
+      <div class="value" style="color:var(--medium)">${rc.MEDIUM.toLocaleString()}</div>
+      <div class="note">${pct(rc.MEDIUM / s.total_customers)} of base</div></div>
+    <div class="card"><div class="label">Low risk</div>
+      <div class="value" style="color:var(--low)">${rc.LOW.toLocaleString()}</div>
+      <div class="note">${pct(rc.LOW / s.total_customers)} of base</div></div>
+    <div class="card"><div class="label">Expected churners</div>
+      <div class="value">${s.expected_churners.toLocaleString()}</div>
+      <div class="note">sum of probabilities, not a count</div></div>
+    <div class="card"><div class="label">Flagged to contact</div>
+      <div class="value">${s.flagged_for_contact.toLocaleString()}</div>
+      <div class="note">at threshold ${s.operating_threshold}</div></div>
+    <div class="card"><div class="label">Revenue at risk</div>
+      <div class="value">${money(s.revenue_at_risk)}</div>
+      <div class="note">historic spend x churn probability</div></div>`;
+
+  $('country').innerHTML = '<option value="">All countries</option>' +
+    s.countries.map(c => `<option value="${c}">${c}</option>`).join('');
+}
+
+async function loadModel() {
+  try {
+    const m = await api('/model');
+    const auc = m.uncertainty_test?.roc_auc;
+    $('modelchip').textContent = auc
+      ? `ROC-AUC ${auc.estimate.toFixed(3)} [${auc.ci_lower.toFixed(2)}–${auc.ci_upper.toFixed(2)}] · ${m.calibration}`
+      : `threshold ${m.operating_threshold}`;
+  } catch { $('modelchip').textContent = 'model card unavailable'; }
+}
+
+function query(offset) {
+  const p = new URLSearchParams({limit: 50, offset, sort: $('sort').value});
+  if ($('risk').value) p.set('risk_level', $('risk').value);
+  if ($('country').value) p.set('country', $('country').value);
+  if ($('q').value.trim()) p.set('q', $('q').value.trim());
+  return '/customers?' + p;
+}
+
+function row(c) {
+  return `<tr data-id="${c.customer_id}" aria-selected="${state.selected === c.customer_id}">
+    <td><strong>${c.customer_id}</strong></td>
+    <td>${c.country}</td>
+    <td class="num">${pct(c.churn_probability)}
+      <div class="bar"><span style="width:${c.churn_probability*100}%;background:${bandColor(c.risk_level)}"></span></div></td>
+    <td><span class="band ${c.risk_level}">${c.risk_level}</span></td>
+    <td class="num">${c.total_orders}</td>
+    <td class="num">${money(c.total_spent)}</td>
+  </tr>`;
+}
+
+async function loadList(append) {
+  const data = await api(query(append ? state.offset : 0));
+  state.total = data.total;
+  state.offset = (append ? state.offset : 0) + data.customers.length;
+
+  const html = data.customers.map(row).join('');
+  if (append) $('rows').insertAdjacentHTML('beforeend', html);
+  else $('rows').innerHTML = html || `<tr><td colspan="6" class="placeholder">No customers match.</td></tr>`;
+
+  $('listcount').textContent = `${data.total.toLocaleString()} matching`;
+  $('shown').textContent = `showing ${Math.min(state.offset, data.total)} of ${data.total.toLocaleString()}`;
+  $('more').disabled = state.offset >= data.total;
+}
+
+async function select(id) {
+  state.selected = id;
+  document.querySelectorAll('#rows tr').forEach(tr =>
+    tr.setAttribute('aria-selected', String(Number(tr.dataset.id) === id)));
+
+  $('detail').className = 'detail';
+  $('detail').innerHTML = '<div class="placeholder">Loading…</div>';
+
+  try {
+    const [c, d] = await Promise.all([
+      api(`/customers/${id}`), api(`/customers/${id}/drivers`)
+    ]);
+
+    const max = Math.max(0.01, ...d.drivers.map(x => Math.abs(x.contribution)));
+
+    const drivers = d.drivers.map(x => {
+      const up = x.contribution >= 0, w = Math.abs(x.contribution) / max * 50;
+      return `<div class="driver">
+        <div class="top">
+          <span class="name">${x.feature.replace(/_/g, ' ')}</span>
+          <span class="val">${x.value.toLocaleString(undefined,{maximumFractionDigits:1})} · ${x.percentile}th pct</span>
+        </div>
+        <div class="track"><div class="mid"></div>
+          <div class="fill" style="${up ? `left:50%;width:${w}%;background:var(--high)`
+                                       : `right:50%;width:${w}%;background:var(--low)`}"></div></div>
+        <div class="val" style="font-size:11px;margin-top:2px">
+          ${up ? 'raises' : 'lowers'} risk by ${Math.abs(x.contribution*100).toFixed(1)} pts
+          vs median ${x.population_median.toLocaleString(undefined,{maximumFractionDigits:1})}</div>
+      </div>`;
+    }).join('') || '<div class="val">No drivers available.</div>';
+
+    const f = c.features;
+    const feats = Object.keys(f).map(k =>
+      `<dt>${k.replace(/_/g,' ')}</dt><dd>${
+        f[k] === null ? '—' : typeof f[k] === 'number'
+          ? f[k].toLocaleString(undefined,{maximumFractionDigits:2}) : f[k]}</dd>`).join('');
+
+    $('detail').innerHTML = `
+      <div class="score-row">
+        ${gauge(c.churn_probability, c.risk_level)}
+        <div class="score-meta">
+          <h3>Customer ${c.customer_id}</h3>
+          <div class="line"><span class="band ${c.risk_level}">${c.risk_level} RISK</span>
+            · ranked ${c.risk_rank.toLocaleString()} of ${state.population.toLocaleString()} by risk</div>
+          <div class="line">${c.country} · joined ${c.signup_date}${c.age ? ` · age ${Math.round(c.age)}` : ''}</div>
+          <div class="line">${c.last_order_date ? `last ordered ${c.last_order_date}` : 'never ordered'}</div>
+          <div class="line">${c.predicted_churn ? 'Flagged for contact at the current threshold.' : 'Below the contact threshold.'}</div>
+        </div>
+      </div>
+
+      <div class="section-title">What is driving this score</div>
+      ${drivers}
+
+      <div class="section-title">Stored features</div>
+      <dl class="kv">${feats}</dl>
+
+      <div class="note-box">
+        Drivers come from one-at-a-time ablation against the population median,
+        not SHAP: each bar is how much the score moves when that single feature
+        is replaced by the typical value. They ignore interactions and do not
+        sum to the prediction. Good enough to triage a worklist, not enough to
+        justify a decision to a customer.
+      </div>`;
+  } catch (e) {
+    $('detail').className = 'error';
+    $('detail').textContent = 'Could not load customer: ' + e.message;
+  }
+}
+
+$('rows').addEventListener('click', e => {
+  const tr = e.target.closest('tr[data-id]');
+  if (tr) select(Number(tr.dataset.id));
+});
+$('more').addEventListener('click', () => loadList(true));
+['risk','country','sort'].forEach(id => $(id).addEventListener('change', () => loadList(false)));
+
+let timer;
+$('q').addEventListener('input', () => {
+  clearTimeout(timer);
+  timer = setTimeout(() => loadList(false), 250);
+});
+
+(async () => {
+  try {
+    await loadModel();
+    await loadSummary();
+    await loadList(false);
+  } catch (e) {
+    document.querySelector('main').insertAdjacentHTML('afterbegin',
+      `<div class="panel error">Could not load data: ${e.message}<br><br>
+       If the model or datasets are missing, run
+       <code>python src/generate_data.py</code> then <code>python src/train.py</code>,
+       and restart the server.</div>`);
+  }
+})();
+</script>
+</body>
+</html>
