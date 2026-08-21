@@ -13,5 +13,10 @@ __pycache__/
 .pytest_cache/
 .env
 
+# Saved container images. `docker save` writes these into the repo
+# folder and they are far past GitHub's 100 MB limit.
+*.tar
+*.tar.gz
+
 # Private keys must never be committed.
 *.pem

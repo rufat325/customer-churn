@@ -8,10 +8,13 @@
 
 services:
   api:
+    # Pull a published image by setting CHURN_IMAGE, or leave it unset to
+    # build from this checkout. Pulling is what a server without the source
+    # (or without a way to copy a 672 MB tarball onto it) needs.
+    image: "${CHURN_IMAGE:-customer-churn:latest}"
     build:
       context: ..
       dockerfile: Dockerfile
-    image: customer-churn:latest
     restart: unless-stopped
     expose:
       - "8000"
